@@ -1,0 +1,749 @@
+import { useState, useRef, useEffect, useCallback } from "react";
+
+// ── DESIGN TOKENS ─────────────────────────────────────────────
+const T = {
+  navy:    "#0B1A2E",
+  navyMid: "#0F2340",
+  navyLight:"#162C4A",
+  forest:  "#1A5C3A",
+  green:   "#00B27A",
+  greenPale:"#7ECFB5",
+  cream:   "#F4EFE6",
+  white:   "#FFFFFF",
+  slate:   "#7A9BB5",
+  gold:    "#E8A838",
+  red:     "#E85555",
+  amber:   "#F0A500",
+};
+
+// ── PROMPTS ───────────────────────────────────────────────────
+const TENANT_SYSTEM = `You are BMR Navigator, a warm and expert guide helping low-income California tenants apply for Below Market Rate (BMR) housing.
+
+When a user shares household size + annual income, ALWAYS respond with both a natural message AND a structured JSON block:
+
+<ELIGIBILITY>
+{
+  "householdSize": 3,
+  "annualIncome": 72000,
+  "amiPercent": 75,
+  "city": "San Francisco",
+  "status": "LIKELY_ELIGIBLE",
+  "statusLabel": "Likely Eligible",
+  "tier": "Low Income (50–80% AMI)",
+  "programs": ["DAHLIA SF BMR Units", "MOHCD Affordable Housing", "Section 8 Vouchers"],
+  "documents": [
+    "Government-issued photo ID (all adults)",
+    "Last 3 months pay stubs",
+    "Most recent 2 years federal tax returns (Form 1040)",
+    "Last 3 months bank statements (all accounts)",
+    "Social Security cards or ITIN letters",
+    "Birth certificates for any minors",
+    "Current lease or landlord contact information"
+  ],
+  "nextSteps": [
+    "Gather your documents using the checklist below",
+    "Visit dahlia.sfgov.org to browse open BMR listings",
+    "Submit your application before the lottery deadline"
+  ],
+  "summary": "Based on your household of 3 and income of $72,000/year, you fall at approximately 75% AMI for San Francisco. You qualify for many BMR units and affordable housing programs."
+}
+</ELIGIBILITY>
+
+Status: LIKELY_ELIGIBLE | MAY_QUALIFY | LIKELY_INELIGIBLE
+SF 2024 100% AMI: 1=$96,100 | 2=$109,850 | 3=$123,600 | 4=$137,300
+
+Be warm, plain-language, and encouraging. Avoid jargon. Format lists cleanly.`;
+
+const DOC_REVIEW_SYSTEM = `You are a BMR housing document reviewer helping a low-income California tenant.
+The user has uploaded a document. Review it and respond with ONLY this JSON:
+{
+  "documentType": "Pay Stub",
+  "isUsable": true,
+  "score": 85,
+  "issues": ["Date is older than 3 months — get a more recent one"],
+  "strengths": ["Employer name visible", "YTD income clearly shown"],
+  "recommendation": "Get a current pay stub dated within the last 90 days.",
+  "missingFields": ["Recent date"],
+  "approvedFields": ["Employer name", "Employee name", "YTD earnings", "Pay period"]
+}
+Score 0-100. Be specific and helpful. This person's housing depends on this.`;
+
+const STAFF_SYSTEM = `You are a BMR housing case manager AI assistant. Help housing organization staff with:
+- Reviewing tenant eligibility summaries
+- Drafting outreach messages to applicants
+- Answering policy questions about BMR programs
+- Generating application status updates
+Be professional, concise, and policy-aware.`;
+
+// ── HELPERS ───────────────────────────────────────────────────
+function parseJSON(text, tag) {
+  const re = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
+  const m = text.match(re);
+  if (!m) return null;
+  try { return JSON.parse(m[1].trim()); } catch { return null; }
+}
+function stripTag(text, tag) {
+  const re = new RegExp(`<${tag}>[\\s\\S]*?<\\/${tag}>`, "g");
+  return text.replace(re, "").trim();
+}
+async function callClaude(system, messages) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-5",
+      max_tokens: 1000,
+      system,
+      messages,
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error?.message || `API error ${res.status}`);
+  return data.content?.map(b => b.text || "").join("") || "";
+}
+
+// ── MOCK STAFF DATA ───────────────────────────────────────────
+const MOCK_APPLICANTS = [
+  { id: 1, name: "Maria G.", household: 4, income: 82000, ami: 71, status: "LIKELY_ELIGIBLE", docs: 6, totalDocs: 7, submitted: "2 hrs ago", city: "San Francisco" },
+  { id: 2, name: "James T.", household: 2, income: 54000, ami: 58, status: "LIKELY_ELIGIBLE", docs: 4, totalDocs: 7, submitted: "5 hrs ago", city: "Oakland" },
+  { id: 3, name: "Anh N.", household: 3, income: 96000, ami: 78, status: "MAY_QUALIFY",       docs: 2, totalDocs: 7, submitted: "1 day ago", city: "San Jose" },
+  { id: 4, name: "DeShawn W.", household: 1, income: 48000, ami: 60, status: "LIKELY_ELIGIBLE", docs: 7, totalDocs: 7, submitted: "1 day ago", city: "San Francisco" },
+  { id: 5, name: "Rosa M.", household: 5, income: 110000, ami: 84, status: "MAY_QUALIFY",      docs: 3, totalDocs: 7, submitted: "2 days ago", city: "Los Angeles" },
+];
+const STATUS_CFG = {
+  LIKELY_ELIGIBLE: { color: T.green,  bg: "rgba(0,178,122,0.12)",  border: "rgba(0,178,122,0.3)",  label: "Likely Eligible" },
+  MAY_QUALIFY:     { color: T.amber,  bg: "rgba(240,165,0,0.12)",   border: "rgba(240,165,0,0.3)",  label: "May Qualify" },
+  LIKELY_INELIGIBLE:{ color: T.red,   bg: "rgba(232,85,85,0.12)",   border: "rgba(232,85,85,0.3)",  label: "Likely Ineligible" },
+};
+
+// ── PILL ──────────────────────────────────────────────────────
+function Pill({ status }) {
+  const c = STATUS_CFG[status] || STATUS_CFG.MAY_QUALIFY;
+  return (
+    <span style={{ background: c.bg, border: `1px solid ${c.border}`, color: c.color,
+      borderRadius: 20, padding: "0.18rem 0.65rem", fontSize: "0.7rem", fontWeight: 700,
+      fontFamily: "Calibri, sans-serif", whiteSpace: "nowrap" }}>
+      {c.label}
+    </span>
+  );
+}
+
+// ── ELIGIBILITY CARD ─────────────────────────────────────────
+function EligibilityCard({ data }) {
+  const [checked, setChecked] = useState({});
+  const cfg = STATUS_CFG[data.status] || STATUS_CFG.MAY_QUALIFY;
+  const done = Object.values(checked).filter(Boolean).length;
+
+  return (
+    <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)",
+      borderRadius: 16, padding: "1.1rem", marginTop: "0.5rem", maxWidth: 500 }}>
+
+      <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", marginBottom: "0.8rem" }}>
+        <span style={{ background: cfg.bg, border: `1px solid ${cfg.border}`, color: cfg.color,
+          borderRadius: 20, padding: "0.25rem 0.75rem", fontSize: "0.78rem", fontWeight: 700 }}>
+          {data.status === "LIKELY_ELIGIBLE" ? "✓" : data.status === "MAY_QUALIFY" ? "~" : "✗"} {cfg.label}
+        </span>
+        <span style={{ color: T.slate, fontSize: "0.72rem" }}>{data.tier}</span>
+      </div>
+
+      <p style={{ color: "rgba(255,255,255,0.7)", fontSize: "0.83rem", lineHeight: 1.6, marginBottom: "0.9rem" }}>
+        {data.summary}
+      </p>
+
+      {/* Stats */}
+      <div style={{ display: "flex", gap: "0.6rem", marginBottom: "0.9rem" }}>
+        {[["AMI", `${data.amiPercent}%`], ["Household", `${data.householdSize} ppl`], ["Income", `$${Math.round(data.annualIncome/1000)}K/yr`]].map(([l, v]) => (
+          <div key={l} style={{ flex: 1, background: "rgba(255,255,255,0.05)", borderRadius: 10, padding: "0.5rem", textAlign: "center" }}>
+            <div style={{ color: T.green, fontSize: "0.95rem", fontWeight: 700 }}>{v}</div>
+            <div style={{ color: T.slate, fontSize: "0.62rem", marginTop: 2 }}>{l}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Programs */}
+      <div style={{ marginBottom: "0.9rem" }}>
+        <div style={{ color: T.slate, fontSize: "0.6rem", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: "0.4rem" }}>Eligible Programs</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3rem" }}>
+          {data.programs?.map(p => (
+            <span key={p} style={{ background: "rgba(0,178,122,0.1)", border: "1px solid rgba(0,178,122,0.2)",
+              borderRadius: 12, padding: "0.18rem 0.55rem", fontSize: "0.72rem", color: T.greenPale }}>{p}</span>
+          ))}
+        </div>
+      </div>
+
+      {/* Checklist */}
+      <div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.4rem" }}>
+          <div style={{ color: T.slate, fontSize: "0.6rem", letterSpacing: "0.1em", textTransform: "uppercase" }}>Document Checklist</div>
+          <div style={{ color: done === data.documents?.length ? T.green : T.slate, fontSize: "0.68rem" }}>
+            {done}/{data.documents?.length} gathered
+          </div>
+        </div>
+        <div style={{ height: 3, background: "rgba(255,255,255,0.07)", borderRadius: 4, marginBottom: "0.65rem" }}>
+          <div style={{ width: `${((done / (data.documents?.length || 1)) * 100)}%`, height: "100%",
+            background: `linear-gradient(90deg, ${T.forest}, ${T.green})`, borderRadius: 4, transition: "width 0.3s" }} />
+        </div>
+        {data.documents?.map((doc, i) => (
+          <div key={i} onClick={() => setChecked(p => ({ ...p, [i]: !p[i] }))}
+            style={{ display: "flex", alignItems: "center", gap: "0.55rem", padding: "0.35rem 0.4rem",
+              borderRadius: 8, cursor: "pointer", marginBottom: "0.15rem",
+              background: checked[i] ? "rgba(0,178,122,0.07)" : "transparent", transition: "background 0.15s" }}>
+            <div style={{ width: 15, height: 15, borderRadius: 4, flexShrink: 0,
+              border: `1.5px solid ${checked[i] ? T.green : "rgba(255,255,255,0.2)"}`,
+              background: checked[i] ? T.green : "transparent",
+              display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.15s" }}>
+              {checked[i] && <span style={{ color: T.navy, fontSize: "0.6rem", fontWeight: 900 }}>✓</span>}
+            </div>
+            <span style={{ fontSize: "0.8rem", color: checked[i] ? "rgba(255,255,255,0.35)" : "rgba(255,255,255,0.75)",
+              textDecoration: checked[i] ? "line-through" : "none", transition: "all 0.15s" }}>{doc}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── DOC REVIEW RESULT ─────────────────────────────────────────
+function DocReviewCard({ result }) {
+  const color = result.score >= 80 ? T.green : result.score >= 50 ? T.amber : T.red;
+  return (
+    <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)",
+      borderRadius: 16, padding: "1.1rem", marginTop: "0.5rem", maxWidth: 500 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.8rem" }}>
+        <div>
+          <div style={{ color: T.white, fontSize: "0.9rem", fontWeight: 700 }}>{result.documentType}</div>
+          <div style={{ color: result.isUsable ? T.green : T.red, fontSize: "0.72rem", marginTop: 2 }}>
+            {result.isUsable ? "✓ Usable" : "✗ Needs attention"}
+          </div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ color, fontSize: "1.6rem", fontWeight: 700, lineHeight: 1 }}>{result.score}</div>
+          <div style={{ color: T.slate, fontSize: "0.62rem" }}>quality score</div>
+        </div>
+      </div>
+
+      <div style={{ height: 4, background: "rgba(255,255,255,0.07)", borderRadius: 4, marginBottom: "0.9rem" }}>
+        <div style={{ width: `${result.score}%`, height: "100%", background: color, borderRadius: 4 }} />
+      </div>
+
+      {result.issues?.length > 0 && (
+        <div style={{ marginBottom: "0.7rem" }}>
+          <div style={{ color: T.red, fontSize: "0.65rem", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: "0.35rem" }}>Issues to fix</div>
+          {result.issues.map((issue, i) => (
+            <div key={i} style={{ display: "flex", gap: "0.4rem", marginBottom: "0.2rem", fontSize: "0.8rem", color: "rgba(255,255,255,0.7)" }}>
+              <span style={{ color: T.red, flexShrink: 0 }}>·</span>{issue}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {result.strengths?.length > 0 && (
+        <div style={{ marginBottom: "0.7rem" }}>
+          <div style={{ color: T.green, fontSize: "0.65rem", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: "0.35rem" }}>Looks good</div>
+          {result.strengths.map((s, i) => (
+            <div key={i} style={{ display: "flex", gap: "0.4rem", marginBottom: "0.2rem", fontSize: "0.8rem", color: "rgba(255,255,255,0.7)" }}>
+              <span style={{ color: T.green, flexShrink: 0 }}>·</span>{s}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: 10, padding: "0.65rem 0.8rem",
+        borderLeft: `3px solid ${color}` }}>
+        <div style={{ color: "rgba(255,255,255,0.75)", fontSize: "0.82rem", lineHeight: 1.5 }}>
+          <strong style={{ color: T.white }}>Recommendation: </strong>{result.recommendation}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── CHAT BUBBLE ───────────────────────────────────────────────
+function Bubble({ msg, eligData, docResult }) {
+  const isUser = msg.role === "user";
+  const text = msg.display || msg.content;
+
+  return (
+    <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start",
+      gap: "0.6rem", animation: "fadeUp 0.25s ease" }}>
+      {!isUser && (
+        <div style={{ width: 28, height: 28, borderRadius: "50%", flexShrink: 0,
+          background: `linear-gradient(135deg, ${T.forest}, ${T.green})`,
+          display: "flex", alignItems: "center", justifyContent: "center", fontSize: "0.75rem", marginTop: 2 }}>
+          🏡
+        </div>
+      )}
+      <div style={{ maxWidth: "70%" }}>
+        {text && (
+          <div style={{
+            padding: "0.75rem 1rem", fontSize: "0.87rem", lineHeight: 1.65,
+            borderRadius: isUser ? "14px 14px 4px 14px" : "4px 14px 14px 14px",
+            background: isUser
+              ? `linear-gradient(135deg, rgba(26,92,58,0.55), rgba(0,178,122,0.18))`
+              : "rgba(255,255,255,0.04)",
+            border: `1px solid ${isUser ? "rgba(0,178,122,0.25)" : "rgba(255,255,255,0.07)"}`,
+            color: isUser ? "#e8f4ee" : "rgba(255,255,255,0.82)",
+          }}>
+            {text.split("\n").map((l, i) => l.trim() === "" ? <div key={i} style={{ height: "0.35rem" }} /> :
+              <div key={i}>{l}</div>)}
+          </div>
+        )}
+        {eligData && <EligibilityCard data={eligData} />}
+        {docResult && <DocReviewCard result={docResult} />}
+      </div>
+    </div>
+  );
+}
+
+// ── TENANT TAB ────────────────────────────────────────────────
+const QUICK = [
+  { label: "Check my eligibility", prompt: "I want to check eligibility. My household has 3 people and we earn $72,000/year in San Francisco." },
+  { label: "What documents do I need?", prompt: "What documents do I need for a BMR application in California?" },
+  { label: "Explain AMI limits", prompt: "Can you explain how AMI income limits work for BMR housing?" },
+  { label: "Find open listings", prompt: "How do I find open BMR listings in California right now?" },
+  { label: "Know my rights", prompt: "What are my fair housing rights as a BMR applicant in California?" },
+  { label: "Review my answers", prompt: "I want help reviewing and improving my application responses before I submit." },
+];
+
+function TenantTab() {
+  const [msgs, setMsgs] = useState([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [started, setStarted] = useState(false);
+  const [uploadedFile, setUploadedFile] = useState(null);
+  const [uploadMode, setUploadMode] = useState(false);
+  const bottomRef = useRef(null);
+  const inputRef = useRef(null);
+  const fileRef = useRef(null);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs, loading]);
+
+  const send = async (text) => {
+    const t = text || input.trim();
+    if (!t || loading) return;
+    setInput(""); setStarted(true);
+    const newMsgs = [...msgs, { role: "user", content: t }];
+    setMsgs(newMsgs);
+    setLoading(true);
+    try {
+      const raw = await callClaude(TENANT_SYSTEM, newMsgs);
+      const eligData = parseJSON(raw, "ELIGIBILITY");
+      const display = stripTag(raw, "ELIGIBILITY");
+      setMsgs([...newMsgs, { role: "assistant", content: raw, display, eligData }]);
+    } catch {
+      setMsgs([...newMsgs, { role: "assistant", content: "Something went wrong. Please try again.", display: "Something went wrong. Please try again." }]);
+    } finally { setLoading(false); setTimeout(() => inputRef.current?.focus(), 100); }
+  };
+
+  const handleFileUpload = async (file) => {
+    if (!file) return;
+    setUploadedFile(file); setStarted(true); setUploadMode(false);
+    const userMsg = { role: "user", content: `[Uploaded: ${file.name}]` };
+    const newMsgs = [...msgs, userMsg];
+    setMsgs(newMsgs); setLoading(true);
+
+    try {
+      const base64 = await new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(r.result.split(",")[1]);
+        r.onerror = rej;
+        r.readAsDataURL(file);
+      });
+      const isImage = file.type.startsWith("image/");
+      const isPDF = file.type === "application/pdf";
+      let apiMessages;
+
+      if (isImage || isPDF) {
+        apiMessages = [{
+          role: "user",
+          content: [
+            { type: isPDF ? "document" : "image",
+              source: { type: "base64", media_type: file.type, data: base64 } },
+            { type: "text", text: "Please review this document for my BMR housing application." }
+          ]
+        }];
+      } else {
+        apiMessages = [{ role: "user", content: `I uploaded a file named "${file.name}". Please review it for my BMR application.` }];
+      }
+
+      const raw = await callClaude(DOC_REVIEW_SYSTEM, apiMessages);
+      let docResult = null;
+      try { docResult = JSON.parse(raw.replace(/```json|```/g, "").trim()); } catch {}
+      const display = docResult ? null : raw;
+      setMsgs([...newMsgs, { role: "assistant", content: raw, display, docResult }]);
+    } catch {
+      setMsgs([...newMsgs, { role: "assistant", content: "Couldn't process that file. Try a JPG, PNG, or PDF.", display: "Couldn't process that file. Try a JPG, PNG, or PDF." }]);
+    } finally { setLoading(false); }
+  };
+
+  return (
+    <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+      {/* Sidebar */}
+      <aside style={{ width: 228, flexShrink: 0, borderRight: "1px solid rgba(255,255,255,0.05)",
+        padding: "1.1rem 0.8rem", background: "rgba(11,26,46,0.6)", backdropFilter: "blur(8px)",
+        display: "flex", flexDirection: "column", gap: "0.4rem", overflowY: "auto" }}>
+        <div style={{ color: T.slate, fontSize: "0.58rem", letterSpacing: "0.12em", textTransform: "uppercase",
+          marginBottom: "0.3rem", paddingLeft: "0.2rem" }}>Quick Start</div>
+        {QUICK.map(q => (
+          <button key={q.label} onClick={() => send(q.prompt)}
+            style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)",
+              borderRadius: 9, padding: "0.55rem 0.75rem", color: "rgba(255,255,255,0.6)", fontSize: "0.74rem",
+              cursor: "pointer", textAlign: "left", fontFamily: "Calibri, sans-serif", transition: "all 0.2s", lineHeight: 1.3 }}
+            onMouseEnter={e => { e.currentTarget.style.background = "rgba(0,178,122,0.1)"; e.currentTarget.style.borderColor = "rgba(0,178,122,0.25)"; e.currentTarget.style.color = "#e8f4ee"; }}
+            onMouseLeave={e => { e.currentTarget.style.background = "rgba(255,255,255,0.03)"; e.currentTarget.style.borderColor = "rgba(255,255,255,0.07)"; e.currentTarget.style.color = "rgba(255,255,255,0.6)"; }}>
+            {q.label}
+          </button>
+        ))}
+
+        {/* Upload button */}
+        <div style={{ marginTop: "0.75rem", borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: "0.75rem" }}>
+          <div style={{ color: T.slate, fontSize: "0.58rem", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: "0.4rem", paddingLeft: "0.2rem" }}>Document Review</div>
+          <button onClick={() => fileRef.current?.click()}
+            style={{ width: "100%", background: "rgba(0,178,122,0.08)", border: "1px dashed rgba(0,178,122,0.3)",
+              borderRadius: 9, padding: "0.65rem", color: T.greenPale, fontSize: "0.74rem",
+              cursor: "pointer", fontFamily: "Calibri, sans-serif", lineHeight: 1.4, textAlign: "center" }}>
+            📄 Upload document<br />
+            <span style={{ fontSize: "0.65rem", color: T.slate }}>JPG, PNG or PDF</span>
+          </button>
+          <input ref={fileRef} type="file" accept=".jpg,.jpeg,.png,.pdf" style={{ display: "none" }}
+            onChange={e => handleFileUpload(e.target.files[0])} />
+        </div>
+
+        <div style={{ marginTop: "auto", padding: "0.75rem", background: "rgba(0,178,122,0.06)",
+          border: "1px solid rgba(0,178,122,0.12)", borderRadius: 10 }}>
+          <div style={{ color: T.greenPale, fontSize: "0.68rem", fontWeight: 700, marginBottom: "0.3rem" }}>How it works</div>
+          <div style={{ color: "rgba(255,255,255,0.38)", fontSize: "0.65rem", lineHeight: 1.55 }}>
+            Share your income & household size for an eligibility check, or upload a document for instant AI review.
+          </div>
+        </div>
+      </aside>
+
+      {/* Chat */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ flex: 1, overflowY: "auto", padding: "1.5rem 1.75rem", display: "flex", flexDirection: "column", gap: "1rem" }}>
+          {!started && (
+            <div style={{ maxWidth: 520, margin: "1.5rem auto", textAlign: "center", animation: "fadeUp 0.5s ease" }}>
+              <div style={{ fontSize: "2.2rem", marginBottom: "0.75rem" }}>🏡</div>
+              <h2 style={{ color: "#e8f4ee", fontSize: "1.5rem", fontWeight: 700, marginBottom: "0.5rem", fontFamily: "Georgia, serif" }}>
+                Your BMR Housing Guide
+              </h2>
+              <p style={{ color: "rgba(255,255,255,0.42)", fontSize: "0.87rem", lineHeight: 1.7, marginBottom: "1.25rem" }}>
+                I'll help you check eligibility, prepare your documents, review your application, and understand your rights — for free.
+              </p>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem", textAlign: "left" }}>
+                {["Instant eligibility check", "Document checklist", "File upload & review", "Fair housing rights"].map(f => (
+                  <div key={f} style={{ display: "flex", alignItems: "center", gap: "0.45rem",
+                    background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)",
+                    borderRadius: 9, padding: "0.5rem 0.7rem" }}>
+                    <span style={{ color: T.green, fontSize: "0.75rem" }}>✓</span>
+                    <span style={{ color: "rgba(255,255,255,0.55)", fontSize: "0.75rem" }}>{f}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {msgs.map((msg, i) => (
+            <Bubble key={i} msg={msg} eligData={msg.eligData} docResult={msg.docResult} />
+          ))}
+
+          {loading && (
+            <div style={{ display: "flex", gap: "0.6rem", alignItems: "center" }}>
+              <div style={{ width: 28, height: 28, borderRadius: "50%", background: `linear-gradient(135deg, ${T.forest}, ${T.green})`,
+                display: "flex", alignItems: "center", justifyContent: "center", fontSize: "0.75rem" }}>🏡</div>
+              <div style={{ padding: "0.65rem 1rem", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)",
+                borderRadius: "4px 14px 14px 14px", display: "flex", gap: "0.3rem" }}>
+                {[0,1,2].map(j => <div key={j} style={{ width: 6, height: 6, borderRadius: "50%", background: T.greenPale, animation: `dot 1.2s ${j*0.2}s infinite` }} />)}
+              </div>
+            </div>
+          )}
+          <div ref={bottomRef} />
+        </div>
+
+        {/* Input bar */}
+        <div style={{ padding: "0.9rem 1.75rem", borderTop: "1px solid rgba(255,255,255,0.05)",
+          background: "rgba(11,26,46,0.75)", backdropFilter: "blur(12px)" }}>
+          <div style={{ display: "flex", gap: "0.6rem", alignItems: "flex-end",
+            background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)",
+            borderRadius: 13, padding: "0.65rem 0.9rem" }}>
+            <textarea ref={inputRef} value={input} rows={2}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }}}
+              placeholder="Ask about eligibility, documents, your rights, or how to complete your application…"
+              style={{ flex: 1, background: "transparent", border: "none", outline: "none",
+                color: "rgba(255,255,255,0.85)", fontSize: "0.86rem", lineHeight: 1.6,
+                resize: "none", fontFamily: "Calibri, sans-serif" }} />
+            <button onClick={() => send()} disabled={!input.trim() || loading}
+              style={{ width: 35, height: 35, borderRadius: 9, border: "none", flexShrink: 0,
+                background: input.trim() && !loading ? `linear-gradient(135deg, ${T.forest}, ${T.green})` : "rgba(255,255,255,0.05)",
+                color: input.trim() && !loading ? "#fff" : "rgba(255,255,255,0.2)",
+                cursor: input.trim() && !loading ? "pointer" : "default", fontSize: "1rem", transition: "all 0.2s",
+                display: "flex", alignItems: "center", justifyContent: "center" }}>↑</button>
+          </div>
+          <p style={{ textAlign: "center", marginTop: "0.45rem", color: "rgba(255,255,255,0.16)", fontSize: "0.6rem" }}>
+            Not legal advice · Verify eligibility with official housing authorities
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── STAFF TAB ─────────────────────────────────────────────────
+function StaffTab() {
+  const [selected, setSelected] = useState(null);
+  const [staffMsgs, setStaffMsgs] = useState([]);
+  const [staffInput, setStaffInput] = useState("");
+  const [staffLoading, setStaffLoading] = useState(false);
+  const [filter, setFilter] = useState("ALL");
+  const staffBottomRef = useRef(null);
+
+  useEffect(() => { staffBottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [staffMsgs]);
+
+  const filtered = MOCK_APPLICANTS.filter(a => filter === "ALL" || a.status === filter);
+
+  const sendStaff = async (text) => {
+    const t = text || staffInput.trim();
+    if (!t || staffLoading) return;
+    setStaffInput("");
+    const ctx = selected ? `Reviewing applicant: ${selected.name}, ${selected.household} people, $${selected.income.toLocaleString()}/yr, ${selected.ami}% AMI, ${selected.docs}/${selected.totalDocs} docs gathered, city: ${selected.city}.\n\n` : "";
+    const newMsgs = [...staffMsgs, { role: "user", content: t }];
+    setStaffMsgs(newMsgs); setStaffLoading(true);
+    try {
+      const raw = await callClaude(STAFF_SYSTEM, newMsgs.map(m => ({ role: m.role, content: ctx + (m.role === "user" && m === newMsgs[newMsgs.length-1] ? m.content : m.content) })));
+      setStaffMsgs([...newMsgs, { role: "assistant", content: raw }]);
+    } catch {
+      setStaffMsgs([...newMsgs, { role: "assistant", content: "Error. Please try again." }]);
+    } finally { setStaffLoading(false); }
+  };
+
+  const totalEligible = MOCK_APPLICANTS.filter(a => a.status === "LIKELY_ELIGIBLE").length;
+  const avgDocs = Math.round(MOCK_APPLICANTS.reduce((s, a) => s + (a.docs / a.totalDocs), 0) / MOCK_APPLICANTS.length * 100);
+  const readyToSubmit = MOCK_APPLICANTS.filter(a => a.docs === a.totalDocs).length;
+
+  return (
+    <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+      {/* Applicant list */}
+      <div style={{ width: 320, flexShrink: 0, borderRight: "1px solid rgba(255,255,255,0.05)",
+        background: "rgba(11,26,46,0.6)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+
+        {/* Stats bar */}
+        <div style={{ padding: "1rem", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0.5rem" }}>
+            {[["Eligible", totalEligible, T.green], ["Avg Docs", `${avgDocs}%`, T.amber], ["Ready", readyToSubmit, T.greenPale]].map(([l, v, c]) => (
+              <div key={l} style={{ background: "rgba(255,255,255,0.04)", borderRadius: 9, padding: "0.5rem", textAlign: "center" }}>
+                <div style={{ color: c, fontSize: "1.1rem", fontWeight: 700 }}>{v}</div>
+                <div style={{ color: T.slate, fontSize: "0.6rem", marginTop: 1 }}>{l}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Filter */}
+        <div style={{ padding: "0.65rem 1rem", borderBottom: "1px solid rgba(255,255,255,0.05)", display: "flex", gap: "0.35rem" }}>
+          {[["ALL", "All"], ["LIKELY_ELIGIBLE", "Eligible"], ["MAY_QUALIFY", "May Qualify"]].map(([v, l]) => (
+            <button key={v} onClick={() => setFilter(v)}
+              style={{ flex: 1, padding: "0.28rem 0", borderRadius: 7, border: "none", fontSize: "0.65rem",
+                cursor: "pointer", fontFamily: "Calibri, sans-serif", transition: "all 0.15s",
+                background: filter === v ? T.green : "rgba(255,255,255,0.05)",
+                color: filter === v ? T.navy : T.slate, fontWeight: filter === v ? 700 : 400 }}>
+              {l}
+            </button>
+          ))}
+        </div>
+
+        {/* List */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "0.5rem" }}>
+          {filtered.map(a => (
+            <div key={a.id} onClick={() => setSelected(a)}
+              style={{ padding: "0.75rem", borderRadius: 10, cursor: "pointer", marginBottom: "0.3rem",
+                background: selected?.id === a.id ? "rgba(0,178,122,0.1)" : "rgba(255,255,255,0.03)",
+                border: `1px solid ${selected?.id === a.id ? "rgba(0,178,122,0.25)" : "rgba(255,255,255,0.06)"}`,
+                transition: "all 0.15s" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "0.35rem" }}>
+                <div style={{ color: T.white, fontSize: "0.82rem", fontWeight: 700 }}>{a.name}</div>
+                <Pill status={a.status} />
+              </div>
+              <div style={{ color: T.slate, fontSize: "0.7rem", marginBottom: "0.4rem" }}>
+                {a.household} ppl · ${a.income.toLocaleString()}/yr · {a.ami}% AMI · {a.city}
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                <div style={{ flex: 1, height: 3, background: "rgba(255,255,255,0.07)", borderRadius: 4 }}>
+                  <div style={{ width: `${(a.docs/a.totalDocs)*100}%`, height: "100%",
+                    background: a.docs === a.totalDocs ? T.green : T.amber, borderRadius: 4 }} />
+                </div>
+                <span style={{ color: T.slate, fontSize: "0.62rem", flexShrink: 0 }}>{a.docs}/{a.totalDocs} docs</span>
+              </div>
+              <div style={{ color: "rgba(255,255,255,0.25)", fontSize: "0.62rem", marginTop: "0.3rem" }}>Submitted {a.submitted}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Staff AI chat */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        {/* Selected applicant header */}
+        {selected && (
+          <div style={{ padding: "0.75rem 1.25rem", borderBottom: "1px solid rgba(255,255,255,0.05)",
+            background: "rgba(0,178,122,0.06)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+              <div style={{ width: 32, height: 32, borderRadius: "50%", background: `linear-gradient(135deg, ${T.forest}, ${T.green})`,
+                display: "flex", alignItems: "center", justifyContent: "center", color: T.white, fontWeight: 700, fontSize: "0.8rem" }}>
+                {selected.name[0]}
+              </div>
+              <div>
+                <div style={{ color: T.white, fontSize: "0.85rem", fontWeight: 700 }}>{selected.name}</div>
+                <div style={{ color: T.slate, fontSize: "0.68rem" }}>{selected.city} · {selected.ami}% AMI · {selected.docs}/{selected.totalDocs} docs</div>
+              </div>
+            </div>
+            <Pill status={selected.status} />
+          </div>
+        )}
+
+        {/* Chat area */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "1.25rem 1.5rem", display: "flex", flexDirection: "column", gap: "0.9rem" }}>
+          {staffMsgs.length === 0 && (
+            <div style={{ maxWidth: 480, margin: "1rem auto", textAlign: "center" }}>
+              <div style={{ fontSize: "1.8rem", marginBottom: "0.65rem" }}>📋</div>
+              <div style={{ color: T.white, fontSize: "1rem", fontWeight: 700, marginBottom: "0.4rem", fontFamily: "Georgia, serif" }}>Staff AI Assistant</div>
+              <p style={{ color: "rgba(255,255,255,0.38)", fontSize: "0.82rem", lineHeight: 1.65, marginBottom: "1rem" }}>
+                Select an applicant from the list, then ask for help drafting outreach, reviewing eligibility, or answering policy questions.
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+                {["Draft a follow-up email for the selected applicant", "What documents is this applicant still missing?", "Is this applicant eligible for Section 8?", "Write a status update I can send to this applicant"].map(s => (
+                  <button key={s} onClick={() => sendStaff(s)}
+                    style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)",
+                      borderRadius: 9, padding: "0.55rem 0.9rem", color: "rgba(255,255,255,0.55)", fontSize: "0.78rem",
+                      cursor: "pointer", textAlign: "left", fontFamily: "Calibri, sans-serif" }}>
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {staffMsgs.map((msg, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: msg.role === "user" ? "flex-end" : "flex-start",
+              gap: "0.5rem", animation: "fadeUp 0.25s ease" }}>
+              {msg.role === "assistant" && (
+                <div style={{ width: 26, height: 26, borderRadius: "50%", background: T.navyLight,
+                  display: "flex", alignItems: "center", justifyContent: "center", fontSize: "0.7rem", flexShrink: 0, marginTop: 2 }}>📋</div>
+              )}
+              <div style={{ maxWidth: "72%", padding: "0.7rem 0.95rem", fontSize: "0.84rem", lineHeight: 1.65,
+                borderRadius: msg.role === "user" ? "14px 14px 4px 14px" : "4px 14px 14px 14px",
+                background: msg.role === "user" ? "rgba(26,92,58,0.4)" : "rgba(255,255,255,0.04)",
+                border: `1px solid ${msg.role === "user" ? "rgba(0,178,122,0.2)" : "rgba(255,255,255,0.07)"}`,
+                color: "rgba(255,255,255,0.82)", whiteSpace: "pre-wrap" }}>
+                {msg.content}
+              </div>
+            </div>
+          ))}
+
+          {staffLoading && (
+            <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+              <div style={{ width: 26, height: 26, borderRadius: "50%", background: T.navyLight, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "0.7rem" }}>📋</div>
+              <div style={{ padding: "0.6rem 0.9rem", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: "4px 14px 14px 14px", display: "flex", gap: "0.3rem" }}>
+                {[0,1,2].map(j => <div key={j} style={{ width: 6, height: 6, borderRadius: "50%", background: T.slate, animation: `dot 1.2s ${j*0.2}s infinite` }} />)}
+              </div>
+            </div>
+          )}
+          <div ref={staffBottomRef} />
+        </div>
+
+        {/* Staff input */}
+        <div style={{ padding: "0.85rem 1.25rem", borderTop: "1px solid rgba(255,255,255,0.05)", background: "rgba(11,26,46,0.75)", backdropFilter: "blur(12px)" }}>
+          <div style={{ display: "flex", gap: "0.55rem", alignItems: "flex-end",
+            background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)",
+            borderRadius: 12, padding: "0.6rem 0.85rem" }}>
+            <textarea value={staffInput} rows={2}
+              onChange={e => setStaffInput(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendStaff(); }}}
+              placeholder={selected ? `Ask about ${selected.name} or request a draft message…` : "Select an applicant then ask a question…"}
+              style={{ flex: 1, background: "transparent", border: "none", outline: "none",
+                color: "rgba(255,255,255,0.85)", fontSize: "0.85rem", lineHeight: 1.6,
+                resize: "none", fontFamily: "Calibri, sans-serif" }} />
+            <button onClick={() => sendStaff()} disabled={!staffInput.trim() || staffLoading}
+              style={{ width: 33, height: 33, borderRadius: 8, border: "none", flexShrink: 0,
+                background: staffInput.trim() && !staffLoading ? `linear-gradient(135deg, ${T.forest}, ${T.green})` : "rgba(255,255,255,0.05)",
+                color: staffInput.trim() && !staffLoading ? "#fff" : "rgba(255,255,255,0.2)",
+                cursor: staffInput.trim() && !staffLoading ? "pointer" : "default", fontSize: "0.95rem", transition: "all 0.2s",
+                display: "flex", alignItems: "center", justifyContent: "center" }}>↑</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── APP ROOT ──────────────────────────────────────────────────
+export default function App() {
+  const [tab, setTab] = useState("tenant");
+
+  return (
+    <div style={{ minHeight: "100vh", background: T.navy, display: "flex", flexDirection: "column",
+      fontFamily: "Calibri, sans-serif", position: "relative", overflow: "hidden" }}>
+
+      {/* Ambient */}
+      <div style={{ position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none",
+        background: `radial-gradient(ellipse at 10% 20%, rgba(26,92,58,0.22) 0%, transparent 50%),
+                     radial-gradient(ellipse at 90% 80%, rgba(0,178,122,0.08) 0%, transparent 50%)` }} />
+      <div style={{ position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none", opacity: 0.025,
+        backgroundImage: `linear-gradient(rgba(255,255,255,1) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,1) 1px, transparent 1px)`,
+        backgroundSize: "44px 44px" }} />
+
+      {/* Header */}
+      <header style={{ position: "relative", zIndex: 10, padding: "0.9rem 1.75rem",
+        borderBottom: "1px solid rgba(255,255,255,0.06)",
+        background: "rgba(11,26,46,0.9)", backdropFilter: "blur(18px)",
+        display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.7rem" }}>
+          <div style={{ width: 32, height: 32, borderRadius: "50%",
+            background: `linear-gradient(135deg, ${T.forest}, ${T.green})`,
+            display: "flex", alignItems: "center", justifyContent: "center", fontSize: "0.85rem" }}>🏡</div>
+          <div>
+            <div style={{ color: "#e8f4ee", fontSize: "0.92rem", fontWeight: 700, letterSpacing: "0.02em", fontFamily: "Georgia, serif" }}>BMR Navigator</div>
+            <div style={{ color: T.slate, fontSize: "0.58rem", letterSpacing: "0.1em", textTransform: "uppercase" }}>AI Housing Platform · California</div>
+          </div>
+        </div>
+
+        {/* Tab switcher */}
+        <div style={{ display: "flex", background: "rgba(255,255,255,0.05)", borderRadius: 10, padding: 3, border: "1px solid rgba(255,255,255,0.07)" }}>
+          {[["tenant", "🏠 Tenant Assistant"], ["staff", "📋 Staff Dashboard"]].map(([id, label]) => (
+            <button key={id} onClick={() => setTab(id)}
+              style={{ padding: "0.38rem 1rem", borderRadius: 8, border: "none",
+                background: tab === id ? T.green : "transparent",
+                color: tab === id ? T.navy : T.slate,
+                fontSize: "0.78rem", cursor: "pointer", fontFamily: "Calibri, sans-serif",
+                fontWeight: tab === id ? 700 : 400, transition: "all 0.2s" }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: "0.4rem",
+          background: "rgba(0,178,122,0.08)", border: "1px solid rgba(0,178,122,0.18)",
+          borderRadius: 20, padding: "0.28rem 0.75rem" }}>
+          <div style={{ width: 6, height: 6, borderRadius: "50%", background: T.green, animation: "glow 2s infinite" }} />
+          <span style={{ color: T.greenPale, fontSize: "0.68rem" }}>AI Online</span>
+        </div>
+      </header>
+
+      {/* Main content */}
+      <div style={{ display: "flex", flex: 1, overflow: "hidden", position: "relative", zIndex: 5 }}>
+        {tab === "tenant" ? <TenantTab /> : <StaffTab />}
+      </div>
+
+      <style>{`
+        @keyframes fadeUp { from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)} }
+        @keyframes dot { 0%,100%{opacity:0.3;transform:scale(0.8)}50%{opacity:1;transform:scale(1.2)} }
+        @keyframes glow { 0%,100%{opacity:0.6}50%{opacity:1} }
+        ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.08);border-radius:4px}
+        textarea::placeholder{color:rgba(255,255,255,0.2)!important}
+      `}</style>
+    </div>
+  );
+}
